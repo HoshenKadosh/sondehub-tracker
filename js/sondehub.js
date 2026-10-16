@@ -2784,6 +2784,86 @@ function mapInfoBox_handle_path(event) {
     mapInfoBox_handle_path_fetch(id, vehicle);
 };
 
+// Full telemetry packets for sondes loaded from history (/sonde/ or the S3 archive),
+// keyed by serial, then by timestamp in ms (same key as vehicle.positions_ts).
+// Only history sondes are stored here, so the live view does not grow memory.
+var historical_packets = {};
+
+// Store raw history packets so the path info box can be shown without the telemetry API.
+// Packets for the same timestamp from multiple uploaders are merged into one entry.
+function storeHistoricalPackets(data) {
+    if (!Array.isArray(data)) return;
+
+    for (var i = 0; i < data.length; i++) {
+        var row = data[i];
+        if (!row || !row.serial) continue;
+
+        // SondeHub V1 archive rows use time_received and string values
+        var is_v1 = row.subtype == "SondehubV1";
+        // SondeHub V1.5 rows carry the sonde type and frequency inside the comment
+        // field (e.g. "RS41 N3540033 403.000 MHz") and also use string values
+        var is_v15 = row.type == "payload_telemetry";
+        var datetime = row.datetime || row.time_received;
+        if (!datetime) continue;
+
+        var ts = convert_time(datetime);
+        if (!historical_packets.hasOwnProperty(row.serial)) {
+            historical_packets[row.serial] = {};
+        }
+        var packets = historical_packets[row.serial];
+
+        if (!packets.hasOwnProperty(ts)) {
+            var packet = {};
+            for (var key in row) {
+                if (!row.hasOwnProperty(key)) continue;
+                // Uploader-specific fields are collected into the uploaders list below
+                if (key == "uploader_callsign" || key == "snr" || key == "rssi") continue;
+                packet[key] = row[key];
+            }
+            if (is_v1 || is_v15) {
+                ["lat", "lon", "alt", "humidity", "temp", "vel_h"].forEach(function(field) {
+                    if (packet.hasOwnProperty(field)) packet[field] = parseFloat(packet[field]);
+                });
+            }
+            if (is_v1) {
+                // V1 rows have no real sonde type, drop the "SondehubV1" marker
+                delete packet.subtype;
+            }
+            if (is_v15) {
+                // Same parsing as formatData(), using the shared v1types / v1manufacturers maps
+                var comment = (packet.comment || "").split(" ");
+                delete packet.type; // "payload_telemetry" is not a sonde type
+                if (v1types.hasOwnProperty(comment[0])) {
+                    packet.type = v1types[comment[0]];
+                    if (v1manufacturers.hasOwnProperty(packet.type)) {
+                        packet.manufacturer = v1manufacturers[packet.type];
+                    }
+                }
+                var comment_frequency = parseFloat(comment[2]);
+                if (!isNaN(comment_frequency)) {
+                    packet.frequency = comment_frequency;
+                }
+            }
+            packet.uploaders = [];
+            packets[ts] = packet;
+        }
+
+        // Skip uploaders already listed for this timestamp (the archive holds duplicate rows,
+        // and the same history file may be loaded more than once)
+        var already_listed = packets[ts].uploaders.some(function(u) {
+            return u.uploader_callsign == row.uploader_callsign;
+        });
+
+        if (row.uploader_callsign && !already_listed) {
+            var uploader = {uploader_callsign: row.uploader_callsign};
+            if (row.hasOwnProperty("snr")) uploader.snr = row.snr;
+            if (row.hasOwnProperty("rssi")) uploader.rssi = row.rssi;
+            if (row.hasOwnProperty("frequency")) uploader.frequency = row.frequency;
+            packets[ts].uploaders.push(uploader);
+        }
+    }
+}
+
 function mapInfoBox_handle_path_fetch(id,vehicle) {
     var date = new Date(parseInt(id)).toISOString()
     var url = newdata_url + "?duration=0&serial=" + vehicle.callsign + "&datetime=" + date;
@@ -2793,118 +2873,47 @@ function mapInfoBox_handle_path_fetch(id,vehicle) {
         url: url,
         dataType: "json",
         success: function(data) {
-            mapInfoBox_handle_path_new(data, vehicle, date);
-        },
-        error: function() {
-            mapInfoBox_handle_path_old(vehicle, id);
-        }     
-    });
-};
-
-function mapInfoBox_handle_path_old(vehicle, id) {
-    var url = "https://api.v2.sondehub.org/sonde/" + vehicle.callsign;
-    var index = vehicle["positions_ids"][vehicle["positions_ts"].indexOf(id)].substring(vehicle.callsign.length + 1);
-    
-    $.ajax({
-        type: "GET",
-        url: url,
-        dataType: "json",
-        success: function(data) {
-            for (var i = 0; i < data.length; i++) {
-                if (data[i]["datetime"] == index) {
-                    data = data[i];
-                    div = document.createElement('div');
-
-                    html = "<div style='line-height:16px;position:relative;'>";
-                    html += "<div><span class='old_path_serial'></span> <span style='' class=''></span></div>";
-                    html += "<hr style='margin:5px 0px'>";
-                    html += "<div style='margin-bottom:5px;'><b><i class='icon-location'></i> </b><span class='old_path_coords'></span></div>";
-
-                    var imp = offline.get('opt_imperial');
-                    var text_alt = Number((imp) ? Math.floor(3.2808399 * parseInt(data.alt)) : parseInt(data.alt)).toLocaleString("us");
-                    text_alt += " " + ((imp) ? 'ft':'m');
-
-                    html += "<div><b>Altitude: </b><span class='old_path_alt'></span></div>";
-                    html += "<div><b>Time: </b><span class='old_path_time_short'></span></div>";
-
-                    var value = vehicle.path_length;
-
-                    html += "<div><b>Distance: </b><span class='old_path_time_distance'></span>";
-
-                    if(offline.get('opt_imperial')) {
-                        var distance = Math.round(value*0.000621371192) + " mi";
-                    } else {
-                        var distance = Math.round(value/10)/100 + " km";
-                    }
-
-                    html += "</div>";
-                    html += "<div><b>Duration: </b><span class='old_path_duration'></span></div>";
-
-                    html += "<hr style='margin:5px 0px'>";
-
-                    if (data.hasOwnProperty("humidity")) {
-                        html += "<div><b>Relative Humidity: </b><span class='old_path_humidity'></span> %</div>";
-                    };
-                    if (data.hasOwnProperty("temp")) {
-                        html += "<div><b>Temperature External: </b><span class='old_path_temp'></span>°C</div>";
-                    };
-                    if (data.hasOwnProperty("comment")) {
-                        html += "<div><b>Comment: </b><span class='old_path_comment'></span></div>";
-                    };
-
-                    html += "<hr style='margin:0px;margin-top:5px'>";
-                    html += "<div style='font-size:11px;'>"
-
-                    if (data.hasOwnProperty("uploader_callsign")) {
-                        html += "<div><span class='old_path_uploader_callsign'></span></div>";
-                    };
-
-                    
-
-                    div.innerHTML = html;
-
-                    div.getElementsByClassName("old_path_serial")[0].textContent = data.serial
-                    div.getElementsByClassName("old_path_time")[0].textContent = "("+data.datetime+")"
-                    div.getElementsByClassName("old_path_coords")[0].innerHTML = format_coordinates(data.lat, data.lon, data.serial)
-                    div.getElementsByClassName("old_path_alt")[0].textContent = text_alt
-                    div.getElementsByClassName("old_path_time_short")[0].textContent = formatDate(stringToDateUTC(data.datetime))
-                    div.getElementsByClassName("old_path_time_distance")[0].textContent = distance
-                    div.getElementsByClassName("old_path_duration")[0].textContent = format_time_friendly(vehicle.start_time, convert_time(vehicle.curr_position.gps_time))
-                    div.getElementsByClassName("old_path_humidity")[0].textContent = data.humidity
-                    div.getElementsByClassName("old_path_temp")[0].textContent = data.temp
-                    div.getElementsByClassName("old_path_comment")[0].textContent = data.comment
-
-                    if (data.hasOwnProperty("uploader_callsign")) {
-                        div.getElementsByClassName("old_path_uploader_callsign")[0].textContent = data.uploader_callsign
-                    }
-
-                    mapInfoBox.setContent(div);
-                    mapInfoBox.openOn(map);
-
-                    setTimeout(function() {
-                        div.parentElement.style.overflow = "";
-                        div.parentElement.style.overflowWrap = "break-word";
-                    }, 16);
-                }
+            if (data && data.hasOwnProperty(vehicle.callsign) && data[vehicle.callsign].hasOwnProperty(date)) {
+                mapInfoBox_handle_path_new(data[vehicle.callsign][date], vehicle, date);
+            } else {
+                // Not in the telemetry API (older sonde), use what is already loaded
+                mapInfoBox_handle_path_local(id, vehicle, date);
             }
         },
         error: function() {
-            mapInfoBox.setContent("not&nbsp;found");
-            mapInfoBox.openOn(map);
-            return;
-        }     
+            mapInfoBox_handle_path_local(id, vehicle, date);
+        }
     });
-}
+};
 
-function mapInfoBox_handle_path_new(data, vehicle, date) {
-    if (Object.keys(data).length === 0) {
+function mapInfoBox_handle_path_local(id, vehicle, date) {
+    var ts = parseInt(id);
+
+    // Full packet from the history data, if this sonde was loaded from history
+    if (historical_packets.hasOwnProperty(vehicle.callsign) && historical_packets[vehicle.callsign].hasOwnProperty(ts)) {
+        mapInfoBox_handle_path_new(historical_packets[vehicle.callsign][ts], vehicle, date);
+        return;
+    }
+
+    // Otherwise build a minimal packet from the path itself (position, altitude, time)
+    var idx = vehicle.positions_ts.indexOf(ts);
+    if (idx == -1) {
         mapInfoBox.setContent("not&nbsp;found");
         mapInfoBox.openOn(map);
         return;
     }
 
-    data = data[vehicle.callsign][date];
+    mapInfoBox_handle_path_new({
+        serial: vehicle.callsign,
+        lat: vehicle.positions[idx].lat,
+        lon: vehicle.positions[idx].lng,
+        alt: vehicle.positions_alts[idx],
+        uploaders: []
+    }, vehicle, date);
+}
 
+// Render the path info box from a single telemetry packet (telemetry API format)
+function mapInfoBox_handle_path_new(data, vehicle, date) {
     div = document.createElement('div');
 
     html = "<div style='line-height:16px;position:relative;'>";
@@ -2935,13 +2944,14 @@ function mapInfoBox_handle_path_new(data, vehicle, date) {
     html += "<hr style='margin:5px 0px'><div class='new_path_props'></div>";
 
     function prop(parent, field_name, description, unit="", fixed=undefined){
-        if (data.hasOwnProperty(field_name)){
+        // Skip missing or null fields (archive packets may contain nulls)
+        if (data.hasOwnProperty(field_name) && data[field_name] !== null){
             var div = document.createElement("div")
             var b = document.createElement("b")
             b.innerText = description + ": "
             var span = document.createElement("span")
             var value = data[field_name];
-            if (fixed){
+            if (fixed && typeof value === "number"){
                 value = value.toFixed(fixed)
             }
             span.textContent = value + " " + unit
@@ -3004,17 +3014,18 @@ function mapInfoBox_handle_path_new(data, vehicle, date) {
 
     var callsign_list = [];
 
-    for (var i = 0; i < data.uploaders.length; i++) {
-        _new_call = data.uploaders[i].uploader_callsign;
+    var uploaders = data.uploaders || [];
+    for (var i = 0; i < uploaders.length; i++) {
+        _new_call = uploaders[i].uploader_callsign;
         tempFields = [];
-        if(data.uploaders[i].hasOwnProperty('snr')) {
-            tempFields.push(data.uploaders[i].snr.toFixed(0) + " dB");
+        if(typeof uploaders[i].snr === 'number') {
+            tempFields.push(uploaders[i].snr.toFixed(0) + " dB");
         } 
-        if(data.uploaders[i].hasOwnProperty('rssi')) {
-            tempFields.push(data.uploaders[i].rssi.toFixed(0) + " dBm");
+        if(typeof uploaders[i].rssi === 'number') {
+            tempFields.push(uploaders[i].rssi.toFixed(0) + " dBm");
         }
-        if(data.uploaders[i].hasOwnProperty('frequency')) {
-            tempFields.push(data.uploaders[i].frequency + " MHz");
+        if(uploaders[i].frequency != null) {
+            tempFields.push(uploaders[i].frequency + " MHz");
         }
         if(tempFields.length > 0) {
             _new_call += " (" + tempFields.join(", ") + ")";
@@ -3579,6 +3590,7 @@ function addPosition(position) {
                 }
               }
             delete vehicles[vehicle_info.callsign];
+            delete historical_packets[vehicle_info.callsign];
         };
 
         // polyline
@@ -4257,6 +4269,8 @@ function refreshSingle(serial) {
       success: function(data, textStatus) {
         var checkLoadedTimer = setInterval(() => {
           if (map){
+            // Keep full packets so the path info box works for archived sondes
+            storeHistoricalPackets(data);
             response = formatData(data, false);
             update(response, true);
             singleRecovery(serial);
@@ -4305,6 +4319,8 @@ function refreshSingleNew(serial) {
         return xhr;
       },
       success: function(data, textStatus) {
+        // An array response means we were redirected to the history archive
+        storeHistoricalPackets(data);
         response = formatData(data, false);
         update(response, true);
       },
@@ -4321,6 +4337,7 @@ function refreshSingleNew(serial) {
                 url: "https://sondehub-history.s3.amazonaws.com/serial/"+ encodeURIComponent(serial) +".json.gz",
                 dataType: "json",
                 success: function(data, textStatus) {
+                  storeHistoricalPackets(data);
                   response = formatData(data, false);
                   update(response, true);
                 },
